@@ -37,15 +37,18 @@ class RSI5MinStrategy(Strategy):
             {'name': 'use_trend_filter', 'type': 'categorical', 'options': [True, False], 'default': True},
             {'name': 'higher_tf_period', 'type': int, 'min': 50, 'max': 200, 'default': 100},
             
-            # Risk Management
-            {'name': 'risk_percentage', 'type': float, 'min': 0.5, 'max': 3.0, 'default': 1.0},
+            # Risk Management (optimized for leveraged trading)
+            {'name': 'risk_percentage', 'type': float, 'min': 0.5, 'max': 2.0, 'default': 1.0},
             {'name': 'atr_period', 'type': int, 'min': 10, 'max': 20, 'default': 14},
-            {'name': 'stop_loss_atr_mult', 'type': float, 'min': 1.5, 'max': 4.0, 'default': 2.5},
-            {'name': 'take_profit_atr_mult', 'type': float, 'min': 2.0, 'max': 6.0, 'default': 3.5},
+            {'name': 'stop_loss_atr_mult', 'type': float, 'min': 1.0, 'max': 3.0, 'default': 2.0},
+            {'name': 'take_profit_atr_mult', 'type': float, 'min': 1.5, 'max': 4.0, 'default': 3.0},
             
             # Advanced Features
             {'name': 'use_volume_filter', 'type': 'categorical', 'options': [True, False], 'default': False},
-            {'name': 'max_hold_candles', 'type': int, 'min': 20, 'max': 100, 'default': 50}
+            {'name': 'max_hold_candles', 'type': int, 'min': 20, 'max': 100, 'default': 50},
+            
+            # Position Size Safety (conservative for leveraged trading)
+            {'name': 'max_capital_per_trade', 'type': float, 'min': 0.05, 'max': 0.5, 'default': 0.15}
         ]
 
     # ========== INDICATOR PROPERTIES ==========
@@ -201,7 +204,13 @@ class RSI5MinStrategy(Strategy):
         2. RSI showing bearish momentum
         3. Trend alignment (if enabled)
         4. Volume confirmation (if enabled)
+        
+        Note: Automatically disabled for spot trading exchanges
         """
+        # Disable shorting for spot exchanges (Jesse requirement)
+        if self.exchange_type == 'spot':
+            return False
+        
         # Core RSI condition - must be overbought
         if self.rsi <= self.hp['rsi_overbought']:
             return False
@@ -234,40 +243,77 @@ class RSI5MinStrategy(Strategy):
         # Calculate stop loss based on ATR
         stop_loss_price = entry_price - (self.atr * self.hp['stop_loss_atr_mult'])
         
+        # Use appropriate capital source based on exchange type
+        if self.exchange_type == 'futures':
+            # For futures with leverage, use leveraged available margin
+            capital = self.leveraged_available_margin
+        else:
+            capital = self.balance
+        
         # Calculate position size based on risk percentage
         qty = utils.risk_to_qty(
-            self.balance,
+            capital,
             self.hp['risk_percentage'],
             entry_price,
             stop_loss_price,
             fee_rate=self.fee_rate
         )
         
+        # Safety check: ensure we don't exceed available capital
+        max_position_size = capital * self.hp['max_capital_per_trade']  # Configurable max capital per trade
+        max_qty = utils.size_to_qty(max_position_size, entry_price, fee_rate=self.fee_rate)
+        
+        # Use the smaller of calculated qty and max safe qty
+        final_qty = min(qty, max_qty)
+        
+        # Additional safety: ensure minimum position size
+        if final_qty <= 0:
+            return  # Skip trade if no valid quantity
+        
         # Execute market buy order
-        self.buy = qty, entry_price
+        self.buy = final_qty, entry_price
         
         # Store entry candle for time-based exit
         self._entry_candle_index = self.index
     
     def go_short(self):
         """Execute short position with proper risk management"""
+        # Skip for spot trading (handled by should_short returning False)
+        if self.exchange_type == 'spot':
+            return
+        
         # Calculate entry price (market order)
         entry_price = self.close
         
         # Calculate stop loss based on ATR
         stop_loss_price = entry_price + (self.atr * self.hp['stop_loss_atr_mult'])
         
+        # Use appropriate capital source (futures only for shorts)
+        # For futures with leverage, use leveraged available margin
+        capital = self.leveraged_available_margin
+        
         # Calculate position size based on risk percentage
         qty = utils.risk_to_qty(
-            self.balance,
+            capital,
             self.hp['risk_percentage'],
             entry_price,
             stop_loss_price,
             fee_rate=self.fee_rate
         )
         
+        # Safety check: ensure we don't exceed available capital
+        max_position_size = capital * self.hp['max_capital_per_trade']  # Configurable max capital per trade
+        max_qty = utils.size_to_qty(max_position_size, entry_price, fee_rate=self.fee_rate)
+        
+        # Use the smaller of calculated qty and max safe qty
+        final_qty = min(qty, max_qty)
+        
+        # Additional safety: ensure minimum position size
+        if final_qty <= 0:
+            return  # Skip trade if no valid quantity
+        
         # Execute market sell order
-        self.sell = qty, entry_price
+        self.sell = final_qty, entry_price
         
         # Store entry candle for time-based exit
         self._entry_candle_index = self.index
@@ -299,6 +345,17 @@ class RSI5MinStrategy(Strategy):
         """Manage open positions with dynamic exits"""
         if not self.position.is_open:
             return
+        
+        # Liquidation protection for leveraged trading
+        if self.exchange_type == 'futures' and hasattr(self, 'liquidation_price'):
+            if self.liquidation_price is not None:
+                # Close position if price gets within 10% of liquidation price
+                if self.is_long and self.close <= self.liquidation_price * 1.1:
+                    self.liquidate()
+                    return
+                elif self.is_short and self.close >= self.liquidation_price * 0.9:
+                    self.liquidate()
+                    return
         
         # Time-based exit - close position if held too long
         entry_candle = self.get_position_entry_candle()
@@ -341,10 +398,25 @@ class RSI5MinStrategy(Strategy):
     
     def watch_list(self):
         """Return watchlist for live trading monitoring"""
-        return [
+        watch_items = [
             ('RSI', round(self.rsi, 2)),
             ('Trend', self.trend_direction),
             ('ATR', round(self.atr, 4)),
             ('Entry Signal Long', self.should_long()),
             ('Entry Signal Short', self.should_short()),
         ]
+        
+        # Add leverage-specific info for futures trading
+        if self.exchange_type == 'futures':
+            watch_items.extend([
+                ('Leverage', self.leverage),
+                ('Available Margin', round(self.available_margin, 2)),
+                ('Leveraged Capital', round(self.leveraged_available_margin, 2))
+            ])
+            
+            # Add liquidation price if position is open
+            if self.position.is_open and hasattr(self, 'liquidation_price'):
+                if self.liquidation_price is not None:
+                    watch_items.append(('Liquidation Price', round(self.liquidation_price, 2)))
+        
+        return watch_items
